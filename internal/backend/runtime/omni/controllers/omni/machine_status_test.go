@@ -13,6 +13,7 @@ import (
 	"github.com/cosi-project/runtime/pkg/resource"
 	"github.com/cosi-project/runtime/pkg/resource/rtestutils"
 	"github.com/cosi-project/runtime/pkg/safe"
+	"github.com/cosi-project/runtime/pkg/state"
 	"github.com/siderolabs/image-factory/pkg/constants"
 	"github.com/siderolabs/image-factory/pkg/schematic"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
@@ -221,16 +222,16 @@ func (suite *MachineStatusSuite) TestMachineUserLabels() {
 
 	metaKey := runtime.NewMetaKey(runtime.NamespaceName, runtime.MetaKeyTagToID(meta.LabelsMeta))
 
-	labels := meta.ImageLabels{
+	imageLabels := meta.ImageLabels{
 		Labels: map[string]string{
-			"label1": "value1",
+			"imageLabel1": "imageLabelVal1",
 		},
 	}
 
-	d, err := labels.Encode()
+	imageLabelsBytes, err := imageLabels.Encode()
 	suite.Require().NoError(err)
 
-	metaKey.TypedSpec().Value = string(d)
+	metaKey.TypedSpec().Value = string(imageLabelsBytes)
 
 	suite.Require().NoError(suite.machineService.state.Create(suite.ctx, metaKey))
 
@@ -250,82 +251,243 @@ func (suite *MachineStatusSuite) TestMachineUserLabels() {
 	rtestutils.AssertResources(ctx, suite.T(), suite.state, []string{testID}, func(status *omni.MachineStatus, assert *assert.Assertions) {
 		assert.NotNilf(status.TypedSpec().Value.ImageLabels, "initial labels not loaded")
 
-		val, ok := status.Metadata().Labels().Get("label1")
-		assert.Truef(ok, "label1 is not set in the initial labels")
-		assert.EqualValues("value1", val)
+		imageLabel1Val, ok := status.Metadata().Labels().Get("imageLabel1")
+		assert.Truef(ok, "imageLabel1 is not set in the initial labels")
+		assert.EqualValues("imageLabelVal1", imageLabel1Val)
+
+		// PlatformMetadata wasn't created yet, so the annotation should be unset
+		_, initialized := status.Metadata().Annotations().Get(omni.PlatformTagLabelsInitialized)
+		assert.False(initialized, "PlatformTagLabelsInitialized annotation must not be set")
 	})
 
 	// now create user labels and see how it merges initial and user labels
 
 	machineLabels := omni.NewMachineLabels(testID)
 	machineLabels.Metadata().Labels().Set("test", "")
+	machineLabels.Metadata().Labels().Set("duplicateInPlatformTagsAndUserLabels", "valueShouldStay")
 
 	suite.Assert().NoError(suite.state.Create(suite.ctx, machineLabels))
 
 	rtestutils.AssertResources(ctx, suite.T(), suite.state, []string{testID}, func(status *omni.MachineStatus, assert *assert.Assertions) {
-		val, ok := status.Metadata().Labels().Get("label1")
-		assert.Truef(ok, "label1 is not set in the initial labels")
-		assert.EqualValues("value1", val)
+		val, ok := status.Metadata().Labels().Get("imageLabel1")
+		assert.Truef(ok, "imageLabel1 is not set")
+		assert.EqualValues("imageLabelVal1", val)
 
 		val, ok = status.Metadata().Labels().Get("test")
-		assert.Truef(ok, "label1 is not set in the initial labels")
+		assert.Truef(ok, "test label is not set")
 		assert.EqualValues("", val)
+
+		val, ok = status.Metadata().Labels().Get("duplicateInPlatformTagsAndUserLabels")
+		assert.Truef(ok, "duplicateInPlatformTagsAndUserLabels label is not set")
+		assert.EqualValues("valueShouldStay", val)
 	})
 
-	// overwrite initial label value
+	// create PlatformMetadata with non-empty Tags and see if they are propagated through MachineLabels
 
-	_, err = safe.StateUpdateWithConflicts[*omni.MachineLabels](ctx, suite.state, machineLabels.Metadata(), func(ml *omni.MachineLabels) error {
-		ml.Metadata().Labels().Set("label1", "gasp")
+	platformMetadata := runtime.NewPlatformMetadataSpec(runtime.NamespaceName, testID)
+	platformMetadata.TypedSpec().Tags = map[string]string{
+		"platformMetadataTag1":                 "platformMetadataValue",
+		"duplicateInPlatformTagsAndUserLabels": "shouldNotOverwriteUserValue",
+	}
+	suite.Assert().NoError(suite.machineService.state.Create(ctx, platformMetadata))
 
-		return nil
+	rtestutils.AssertResources(ctx, suite.T(), suite.state, []string{testID}, func(status *omni.MachineStatus, assert *assert.Assertions) {
+		_, initialized := status.Metadata().Annotations().Get(omni.PlatformTagLabelsInitialized)
+		assert.True(initialized, "PlatformTagLabelsInitialized annotation must be set")
+
+		assert.NotNilf(status.TypedSpec().Value.ImageLabels, "initial labels not loaded")
+
+		imageLabel1Val, ok := status.Metadata().Labels().Get("imageLabel1")
+		assert.Truef(ok, "imageLabel1 is not set")
+		assert.EqualValues("imageLabelVal1", imageLabel1Val)
+
+		platformMetadataVal, ok := status.Metadata().Labels().Get("platformMetadataTag1")
+		assert.Truef(ok, "platformMetadataTag is not set")
+		assert.EqualValues("platformMetadataValue", platformMetadataVal)
+
+		duplicateInPlatformTagsAndUserLabelsVal, ok := status.Metadata().Labels().Get("duplicateInPlatformTagsAndUserLabels")
+		assert.Truef(ok, "duplicateInPlatformTagsAndUserLabels is not set")
+		assert.EqualValues("valueShouldStay", duplicateInPlatformTagsAndUserLabelsVal)
 	})
 
+	// overwrite image label value via MachineLabels
+	_, err = safe.StateUpdateWithConflicts(
+		ctx, suite.state,
+		omni.NewMachineLabels(testID).Metadata(),
+		func(machineLabels *omni.MachineLabels) error {
+			machineLabels.Metadata().Labels().Set("imageLabel1", "gasp")
+
+			return nil
+		},
+		state.WithUpdateOwner(""),
+	)
 	suite.Require().NoError(err)
 
 	rtestutils.AssertResources(ctx, suite.T(), suite.state, []string{testID}, func(status *omni.MachineStatus, assert *assert.Assertions) {
-		val, ok := status.Metadata().Labels().Get("label1")
-		assert.Truef(ok, "label1 doesn't exist")
+		val, ok := status.Metadata().Labels().Get("imageLabel1")
+		assert.Truef(ok, "imageLabel1 doesn't exist")
 		assert.EqualValues("gasp", val)
+
+		platformMetadataVal, ok := status.Metadata().Labels().Get("platformMetadataTag1")
+		assert.Truef(ok, "platformMetadataTag doesn't exist")
+		assert.EqualValues("platformMetadataValue", platformMetadataVal)
 	})
 
-	// reverts back to initial when the machine labels resource gets removed
+	// labels created from PlatformMetadata tags should be removable by the user
+	_, err = safe.StateUpdateWithConflicts(ctx, suite.state,
+		omni.NewMachineLabels(testID).Metadata(),
+		func(machineLabels *omni.MachineLabels) error {
+			machineLabels.Metadata().Labels().Delete("platformMetadataTag1")
 
+			return nil
+		}, state.WithUpdateOwner(""))
+	suite.Require().NoError(err)
+
+	rtestutils.AssertResources(ctx, suite.T(), suite.state, []string{testID}, func(status *omni.MachineStatus, assert *assert.Assertions) {
+		val, ok := status.Metadata().Labels().Get("imageLabel1")
+		assert.Truef(ok, "imageLabel1 doesn't exist")
+		assert.EqualValues("gasp", val)
+
+		_, ok = status.Metadata().Labels().Get("platformMetadataTag1")
+		assert.Falsef(ok, "platformMetadataTag1 should not be set after it's removed from MachineLabels")
+	})
+
+	// Trigger MachineStatusController reconciliation through an Info event.
+	// Ensures platform tag labels are not re-added after being removed.
+	_, err = safe.StateUpdateWithConflicts(ctx, suite.machineService.state, platformMetadata.Metadata(),
+		func(res *runtime.PlatformMetadata) error {
+			return nil
+		})
+	suite.Require().NoError(err)
+
+	rtestutils.AssertResources(ctx, suite.T(), suite.state, []string{testID}, func(status *omni.MachineStatus, assert *assert.Assertions) {
+		val, ok := status.Metadata().Labels().Get("imageLabel1")
+		assert.Truef(ok, "imageLabel1 doesn't exist")
+		assert.EqualValues("gasp", val)
+
+		_, ok = status.Metadata().Labels().Get("platformMetadataTag1")
+		assert.Falsef(ok, "platformMetadataTag1 should not be set after MachineLabels removal")
+	})
+
+	// after MachineLabels removal: image labels revert, platform tag disappears (it was only stored in MachineLabels)
 	rtestutils.Destroy[*omni.MachineLabels](suite.ctx, suite.T(), suite.state, []string{testID})
 
 	rtestutils.AssertResources(ctx, suite.T(), suite.state, []string{testID}, func(status *omni.MachineStatus, assert *assert.Assertions) {
-		val, ok := status.Metadata().Labels().Get("label1")
-		assert.Truef(ok, "label1 doesn't exist")
-		assert.EqualValues("value1", val)
+		val, ok := status.Metadata().Labels().Get("imageLabel1")
+		assert.Truef(ok, "imageLabel1 doesn't exist")
+		assert.EqualValues("imageLabelVal1", val)
+
+		_, ok = status.Metadata().Labels().Get("platformMetadataTag1")
+		assert.Falsef(ok, "platformMetadataTag1 should not be set after MachineLabels removal")
 	})
 
-	machineLabels.Metadata().Labels().Set("label2", "aaa")
+	// MachineLabels value takes precedence over image labels for the same key
+	newMachineLabels := omni.NewMachineLabels(testID)
+	newMachineLabels.Metadata().Labels().Set("imageLabel2", "aaa")
 
-	suite.Assert().NoError(suite.state.Create(suite.ctx, machineLabels))
+	suite.Assert().NoError(suite.state.Create(suite.ctx, newMachineLabels))
 
 	_, err = safe.StateUpdateWithConflicts(ctx, suite.machineService.state, metaKey.Metadata(), func(res *runtime.MetaKey) error {
-		labels.Labels["label1"] = "updated"
-		labels.Labels["label2"] = "override"
+		imageLabels.Labels["imageLabel1"] = "updated"
+		imageLabels.Labels["imageLabel2"] = "override"
 
-		d, err = labels.Encode()
-		if err != nil {
-			return err
+		encoded, encodeErr := imageLabels.Encode()
+		if encodeErr != nil {
+			return encodeErr
 		}
 
-		res.TypedSpec().Value = string(d)
+		res.TypedSpec().Value = string(encoded)
 
 		return nil
 	})
-
 	suite.Require().NoError(err)
 
 	rtestutils.AssertResources(ctx, suite.T(), suite.state, []string{testID}, func(status *omni.MachineStatus, assert *assert.Assertions) {
-		val, ok := status.Metadata().Labels().Get("label1")
-		assert.Truef(ok, "label1 doesn't exist")
+		val, ok := status.Metadata().Labels().Get("imageLabel1")
+		assert.Truef(ok, "imageLabel1 doesn't exist")
 		assert.EqualValues("updated", val)
 
-		val, ok = status.Metadata().Labels().Get("label2")
-		assert.Truef(ok, "label2 doesn't exist")
+		val, ok = status.Metadata().Labels().Get("imageLabel2")
+		assert.Truef(ok, "imageLabel2 doesn't exist")
 		assert.EqualValues("aaa", val)
+	})
+}
+
+// TestMachineUserLabelsEmptyPlatformTags verifies that when PlatformMetadata carries no tags,
+// the PlatformTagLabelsInitialized annotation is still stamped on MachineStatus and pre-existing
+// user labels are left untouched across repeated reconciliations. It also verifies that tags
+// subsequently added to PlatformMetadata are not propagated to MachineLabels, because the
+// annotation already marks the one-time bootstrap as done.
+func (suite *MachineStatusSuite) TestMachineUserLabelsEmptyPlatformTags() {
+	suite.setup()
+
+	machine := omni.NewMachine(testID)
+	spec := machine.TypedSpec().Value
+
+	spec.Connected = true
+	spec.ManagementAddress = suite.socketConnectionString
+
+	machineStatusSnapshot := omni.NewMachineStatusSnapshot(testID)
+	machineStatusSnapshot.TypedSpec().Value = &specs.MachineStatusSnapshotSpec{
+		MachineStatus: &machineapi.MachineStatusEvent{},
+	}
+
+	suite.Assert().NoError(suite.state.Create(suite.ctx, machine))
+	suite.Assert().NoError(suite.state.Create(suite.ctx, machineStatusSnapshot))
+
+	machineLabels := omni.NewMachineLabels(testID)
+	machineLabels.Metadata().Labels().Set("userLabel1", "userValue1")
+	machineLabels.Metadata().Labels().Set("userLabel2", "userValue2")
+
+	suite.Assert().NoError(suite.state.Create(suite.ctx, machineLabels))
+
+	ctx, cancel := context.WithTimeout(suite.ctx, time.Second*5)
+	defer cancel()
+
+	// create PlatformMetadata with empty Tags
+	platformMetadata := runtime.NewPlatformMetadataSpec(runtime.NamespaceName, testID)
+	suite.Assert().NoError(suite.machineService.state.Create(ctx, platformMetadata))
+
+	// the annotation must be set even when Tags is empty, and no extra labels should appear
+	rtestutils.AssertResources(ctx, suite.T(), suite.state, []string{testID}, func(status *omni.MachineStatus, assert *assert.Assertions) {
+		_, initialized := status.Metadata().Annotations().Get(omni.PlatformTagLabelsInitialized)
+		assert.True(initialized, "PlatformTagLabelsInitialized annotation must be set even when platform tags are empty")
+
+		val, ok := status.Metadata().Labels().Get("userLabel1")
+		assert.Truef(ok, "userLabel1 should still be set")
+		assert.EqualValues("userValue1", val)
+
+		val, ok = status.Metadata().Labels().Get("userLabel2")
+		assert.Truef(ok, "userLabel2 should still be set")
+		assert.EqualValues("userValue2", val)
+	})
+
+	// update PlatformMetadata to now carry non-empty tags — because the annotation is already set,
+	// these tags must NOT be bootstrapped into MachineLabels
+	_, err := safe.StateUpdateWithConflicts(ctx, suite.machineService.state, platformMetadata.Metadata(),
+		func(res *runtime.PlatformMetadata) error {
+			res.TypedSpec().Tags = map[string]string{
+				"lateTag1": "lateValue1",
+			}
+
+			return nil
+		})
+	suite.Require().NoError(err)
+
+	rtestutils.AssertResources(ctx, suite.T(), suite.state, []string{testID}, func(status *omni.MachineStatus, assert *assert.Assertions) {
+		_, initialized := status.Metadata().Annotations().Get(omni.PlatformTagLabelsInitialized)
+		assert.True(initialized, "PlatformTagLabelsInitialized annotation must remain set after re-reconciliation")
+
+		val, ok := status.Metadata().Labels().Get("userLabel1")
+		assert.Truef(ok, "userLabel1 should still be set after re-reconciliation")
+		assert.EqualValues("userValue1", val)
+
+		val, ok = status.Metadata().Labels().Get("userLabel2")
+		assert.Truef(ok, "userLabel2 should still be set after re-reconciliation")
+		assert.EqualValues("userValue2", val)
+
+		_, ok = status.Metadata().Labels().Get("lateTag1")
+		assert.Falsef(ok, "lateTag1 must not be added: bootstrap already ran when tags were empty")
 	})
 }
 
