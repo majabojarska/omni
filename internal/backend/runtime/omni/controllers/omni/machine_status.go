@@ -467,22 +467,17 @@ func (ctrl *MachineStatusController) handleNotification(ctx context.Context, r c
 }
 
 // reconcilePlatformTagLabels bootstraps a MachineLabels resource from PlatformMetadata tags on the first join
-// and stamps the PlatformTagLabelsInitialized annotation on machineStatus when done.
+// and stamps the PlatformTagLabelsInitialized annotation on machineLabels when done.
 // Subsequent calls are short-circuited by the annotation.
 // We only populate these labels on Omni join; from there on the user can freely modify them.
 func (ctrl *MachineStatusController) reconcilePlatformTagLabels(ctx context.Context, r controller.QRuntime, machineStatus *omni.MachineStatus) error {
-	if _, isAlreadyInitialized := machineStatus.Metadata().Annotations().Get(omni.PlatformTagLabelsInitialized); isAlreadyInitialized {
-		return nil
-	}
-
 	tags := machineStatus.TypedSpec().Value.PlatformMetadata.GetTags()
-	if len(tags) == 0 {
-		machineStatus.Metadata().Annotations().Set(omni.PlatformTagLabelsInitialized, "")
 
-		return nil
-	}
+	return safe.WriterModify(ctx, r, omni.NewMachineLabels(machineStatus.Metadata().ID()), func(machineLabels *omni.MachineLabels) error {
+		if _, isAlreadyInitialized := machineLabels.Metadata().Annotations().Get(omni.PlatformTagLabelsInitialized); isAlreadyInitialized {
+			return nil
+		}
 
-	if err := safe.WriterModify(ctx, r, omni.NewMachineLabels(machineStatus.Metadata().ID()), func(machineLabels *omni.MachineLabels) error {
 		for k, v := range tags {
 			// Do not overwrite pre-existing user labels.
 			if _, ok := machineLabels.Metadata().Labels().Get(k); !ok {
@@ -490,15 +485,11 @@ func (ctrl *MachineStatusController) reconcilePlatformTagLabels(ctx context.Cont
 			}
 		}
 
+		// Do not ever re-apply labels based on platform metadata tags.
+		machineLabels.Metadata().Annotations().Set(omni.PlatformTagLabelsInitialized, "")
+
 		return nil
-	}, controller.WithModifyNoOwner()); err != nil {
-		return err
-	}
-
-	// Do not ever re-apply labels based on platform metadata tags.
-	machineStatus.Metadata().Annotations().Set(omni.PlatformTagLabelsInitialized, "")
-
-	return nil
+	}, controller.WithModifyNoOwner())
 }
 
 func (ctrl *MachineStatusController) handleEventSchematic(ctx context.Context, ms *omni.MachineStatus, event machinetask.Info) error {
